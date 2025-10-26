@@ -6,14 +6,28 @@
 """
 
 import os
-import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import train_test_split
+
+# 尝试导入可选依赖
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+    print("Warning: cv2 (OpenCV) not available. Some functions may not work.")
+
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    HAS_ALBUMENTATIONS = True
+except ImportError:
+    HAS_ALBUMENTATIONS = False
+    print("Warning: albumentations not available. Using basic transforms.")
 
 
 def rle_encode(im):
@@ -154,8 +168,15 @@ def load_data(data_dir, train_mask_csv):
     Returns:
         tuple: (train_paths, train_rles, test_paths)
     """
-    # 加载训练数据
-    train_mask_df = pd.read_csv(train_mask_csv)
+    # 检查是否存在修复后的CSV文件
+    fixed_csv_path = train_mask_csv.replace('.csv', '_fixed.csv')
+    if os.path.exists(fixed_csv_path):
+        print(f"使用修复后的CSV文件: {fixed_csv_path}")
+        train_mask_df = pd.read_csv(fixed_csv_path)
+    else:
+        print(f"使用原始CSV文件: {train_mask_csv}")
+        train_mask_df = pd.read_csv(train_mask_csv)
+    
     train_dir = os.path.join(data_dir, 'train')
     
     train_paths = []

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-训练模块
+基于Hugging Face训练框架的训练模块
 包含训练、验证、测试等核心功能
 """
 
@@ -17,33 +17,60 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
+# Hugging Face imports
+from transformers import (
+    Trainer, 
+    TrainingArguments, 
+    EarlyStoppingCallback,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl
+)
+from transformers.trainer_utils import get_last_checkpoint
+
 from model import get_model, get_loss_fn, get_optimizer, get_scheduler
 from data_utils import TianChiDataset, rle_encode, rle_decode
 
 
-class Trainer:
+class CustomTrainer(Trainer):
     """
-    训练器类
+    基于Hugging Face的自定义训练器类
     负责模型训练、验证和测试
     """
     
-    def __init__(self, model, config):
-        self.model = model
+    def __init__(self, model, config, train_dataset, eval_dataset=None, **kwargs):
         self.config = config
         self.device = config.DEVICE
         
-        # 损失函数和优化器
-        self.criterion = get_loss_fn('combined')
-        self.optimizer = get_optimizer(
-            model, 
-            optimizer_name='adamw', 
-            lr=config.LEARNING_RATE, 
-            weight_decay=config.WEIGHT_DECAY
+        # 设置训练参数
+        training_args = TrainingArguments(
+            output_dir=config.MODEL_SAVE_DIR,
+            num_train_epochs=config.NUM_EPOCHS,
+            per_device_train_batch_size=config.BATCH_SIZE,
+            per_device_eval_batch_size=config.BATCH_SIZE,
+            learning_rate=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY,
+            warmup_steps=100,
+            logging_dir=f"{config.MODEL_SAVE_DIR}/logs",
+            logging_steps=10,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            save_total_limit=3,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_dice",
+            greater_is_better=True,
+            report_to=None,  # 禁用wandb等
+            dataloader_num_workers=4,
+            fp16=torch.cuda.is_available(),
+            remove_unused_columns=False,
         )
-        self.scheduler = get_scheduler(
-            self.optimizer, 
-            scheduler_name='cosine', 
-            T_max=config.NUM_EPOCHS
+        
+        super().__init__(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            **kwargs
         )
         
         # 训练历史
@@ -53,67 +80,63 @@ class Trainer:
         self.best_score = 0.0
         self.best_epoch = 0
         
-    def train_epoch(self, train_loader):
+    def compute_loss(self, model, inputs, return_outputs=False):
         """
-        训练一个epoch
+        计算损失函数
         
         Args:
-            train_loader: 训练数据加载器
+            model: 模型
+            inputs: 输入数据
+            return_outputs: 是否返回输出
         
         Returns:
-            float: 平均训练损失
+            loss或(loss, outputs)
         """
-        self.model.train()
-        total_loss = 0.0
-        num_batches = len(train_loader)
+        images = inputs["images"]
+        masks = inputs["masks"]
         
-        pbar = tqdm(train_loader, desc="训练中")
-        for batch_idx, (images, masks) in enumerate(pbar):
-            images = images.to(self.device)
-            masks = masks.to(self.device)
-            
-            # 前向传播
-            self.optimizer.zero_grad()
-            outputs = self.model(images)
-            
-            # 处理不同模型的输出格式
-            if isinstance(outputs, dict):
-                outputs = outputs['out']
-            
-            loss = self.criterion(outputs, masks)
-            
-            # 反向传播
-            loss.backward()
-            self.optimizer.step()
-            
-            total_loss += loss.item()
-            
-            # 更新进度条
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss / (batch_idx + 1):.4f}'
-            })
+        # 前向传播
+        outputs = model(images)
         
-        return total_loss / num_batches
+        # 处理不同模型的输出格式
+        if isinstance(outputs, dict):
+            outputs = outputs['out']
+        
+        # 计算损失
+        criterion = get_loss_fn('combined')
+        loss = criterion(outputs, masks)
+        
+        if return_outputs:
+            return loss, outputs
+        return loss
     
-    def validate_epoch(self, val_loader):
+    def evaluate(self, eval_dataset=None):
         """
-        验证一个epoch
+        评估模型性能
         
         Args:
-            val_loader: 验证数据加载器
+            eval_dataset: 评估数据集
         
         Returns:
-            tuple: (平均验证损失, Dice分数)
+            dict: 评估指标
         """
+        eval_dataset = eval_dataset or self.eval_dataset
+        if eval_dataset is None:
+            return {}
+        
         self.model.eval()
         total_loss = 0.0
         total_dice = 0.0
-        num_batches = len(val_loader)
+        num_samples = 0
         
         with torch.no_grad():
-            pbar = tqdm(val_loader, desc="验证中")
-            for batch_idx, (images, masks) in enumerate(pbar):
+            for batch in eval_dataset:
+                if isinstance(batch, dict):
+                    images = batch["images"]
+                    masks = batch["masks"]
+                else:
+                    images, masks = batch
+                
                 images = images.to(self.device)
                 masks = masks.to(self.device)
                 
@@ -122,7 +145,8 @@ class Trainer:
                 if isinstance(outputs, dict):
                     outputs = outputs['out']
                 
-                loss = self.criterion(outputs, masks)
+                # 计算损失
+                loss = self.compute_loss(self.model, {"images": images, "masks": masks})
                 total_loss += loss.item()
                 
                 # 计算Dice分数
@@ -130,16 +154,15 @@ class Trainer:
                 dice_score = self.calculate_dice(preds, masks)
                 total_dice += dice_score
                 
-                # 更新进度条
-                pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'dice': f'{dice_score:.4f}'
-                })
+                num_samples += images.size(0)
         
-        avg_loss = total_loss / num_batches
-        avg_dice = total_dice / num_batches
+        avg_loss = total_loss / len(eval_dataset)
+        avg_dice = total_dice / len(eval_dataset)
         
-        return avg_loss, avg_dice
+        return {
+            "eval_loss": avg_loss,
+            "eval_dice": avg_dice
+        }
     
     def calculate_dice(self, pred, target, smooth=1e-6):
         """
@@ -165,64 +188,118 @@ class Trainer:
         
         return dice.mean().item()
     
-    def train(self, train_loader, val_loader):
+    def train_model(self):
         """
-        完整训练流程
-        
-        Args:
-            train_loader: 训练数据加载器
-            val_loader: 验证数据加载器
+        使用Hugging Face框架进行训练
         """
         print("开始训练...")
-        print(f"训练集大小: {len(train_loader.dataset)}")
-        print(f"验证集大小: {len(val_loader.dataset)}")
-        print(f"总epoch数: {self.config.NUM_EPOCHS}")
+        print(f"训练集大小: {len(self.train_dataset)}")
+        if self.eval_dataset:
+            print(f"验证集大小: {len(self.eval_dataset)}")
+        print(f"总epoch数: {self.args.num_train_epochs}")
         
         start_time = time.time()
         
-        for epoch in range(self.config.NUM_EPOCHS):
-            print(f"\nEpoch {epoch + 1}/{self.config.NUM_EPOCHS}")
-            print("-" * 50)
-            
-            # 训练
-            train_loss = self.train_epoch(train_loader)
-            self.train_losses.append(train_loss)
-            
-            # 验证
-            val_loss, val_dice = self.validate_epoch(val_loader)
-            self.val_losses.append(val_loss)
-            self.val_scores.append(val_dice)
-            
-            # 学习率调度
-            self.scheduler.step()
-            current_lr = self.optimizer.param_groups[0]['lr']
-            
-            print(f"训练损失: {train_loss:.4f}")
-            print(f"验证损失: {val_loss:.4f}")
-            print(f"验证Dice: {val_dice:.4f}")
-            print(f"学习率: {current_lr:.6f}")
-            
-            # 保存最佳模型
-            if val_dice > self.best_score:
-                self.best_score = val_dice
-                self.best_epoch = epoch + 1
-                self.save_model(f"best_model_epoch_{epoch + 1}.pth")
-                print(f"新的最佳模型! Dice: {val_dice:.4f}")
-            
-            # 每10个epoch保存一次模型
-            if (epoch + 1) % 10 == 0:
-                self.save_model(f"model_epoch_{epoch + 1}.pth")
+        # 添加回调函数
+        callbacks = [
+            EarlyStoppingCallback(early_stopping_patience=10),
+            TrainingCallback(self)
+        ]
+        
+        # 开始训练
+        train_result = self.train(callbacks=callbacks)
         
         # 训练完成
         training_time = time.time() - start_time
         print(f"\n训练完成! 总用时: {training_time:.2f}秒")
-        print(f"最佳验证Dice: {self.best_score:.4f} (Epoch {self.best_epoch})")
         
         # 保存训练历史
         self.save_training_history()
         
         # 绘制训练曲线
         self.plot_training_curves()
+        
+        return train_result
+    
+    def predict(self, test_dataset, model_path=None):
+        """
+        预测测试集
+        
+        Args:
+            test_dataset: 测试数据集
+            model_path: 模型路径（可选）
+        
+        Returns:
+            list: 预测结果列表
+        """
+        if model_path:
+            self.load_model(model_path)
+        
+        self.model.eval()
+        predictions = []
+        
+        print("开始预测...")
+        with torch.no_grad():
+            pbar = tqdm(test_dataset, desc="预测中")
+            for batch in pbar:
+                if isinstance(batch, dict):
+                    images = batch["images"]
+                else:
+                    images, _ = batch
+                
+                images = images.to(self.device)
+                
+                # 前向传播
+                outputs = self.model(images)
+                if isinstance(outputs, dict):
+                    outputs = outputs['out']
+                
+                # 应用sigmoid激活
+                preds = torch.sigmoid(outputs)
+                
+                # 转换为numpy数组
+                preds = preds.cpu().numpy()
+                
+                # 处理每个样本
+                for pred in preds:
+                    # 二值化
+                    pred_binary = (pred[0] > 0.5).astype(np.uint8)
+                    
+                    # RLE编码
+                    rle = rle_encode(pred_binary)
+                    predictions.append(rle)
+        
+        print(f"预测完成! 共{len(predictions)}个样本")
+        return predictions
+
+
+class TrainingCallback(TrainerCallback):
+    """
+    训练回调函数
+    用于记录训练历史和保存最佳模型
+    """
+    
+    def __init__(self, custom_trainer):
+        self.custom_trainer = custom_trainer
+    
+    def on_evaluate(self, args, state, control, model=None, logs=None, **kwargs):
+        """评估完成后的回调"""
+        if logs:
+            eval_loss = logs.get("eval_loss", 0)
+            eval_dice = logs.get("eval_dice", 0)
+            
+            self.custom_trainer.val_losses.append(eval_loss)
+            self.custom_trainer.val_scores.append(eval_dice)
+            
+            if eval_dice > self.custom_trainer.best_score:
+                self.custom_trainer.best_score = eval_dice
+                self.custom_trainer.best_epoch = state.epoch
+                print(f"新的最佳模型! Dice: {eval_dice:.4f}")
+    
+    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        """日志记录回调"""
+        if logs and "train_loss" in logs:
+            self.custom_trainer.train_losses.append(logs["train_loss"])
     
     def save_model(self, filename):
         """
@@ -234,11 +311,9 @@ class Trainer:
         save_path = os.path.join(self.config.MODEL_SAVE_DIR, filename)
         torch.save({
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'epoch': len(self.train_losses),
-            'best_score': self.best_score,
-            'config': self.config.__dict__
+            'epoch': len(self.custom_trainer.train_losses),
+            'best_score': self.custom_trainer.best_score,
+            'config': self.custom_trainer.config.__dict__
         }, save_path)
         print(f"模型已保存: {save_path}")
     
@@ -253,12 +328,11 @@ class Trainer:
         checkpoint = torch.load(load_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
         print(f"模型已加载: {load_path}")
         return checkpoint
-    
+
+
     def save_training_history(self):
         """
         保存训练历史
@@ -308,52 +382,6 @@ class Trainer:
         plt.show()
         
         print(f"训练曲线已保存: {plot_path}")
-    
-    def predict(self, test_loader, model_path=None):
-        """
-        预测测试集
-        
-        Args:
-            test_loader: 测试数据加载器
-            model_path: 模型路径（可选）
-        
-        Returns:
-            list: 预测结果列表
-        """
-        if model_path:
-            self.load_model(model_path)
-        
-        self.model.eval()
-        predictions = []
-        
-        print("开始预测...")
-        with torch.no_grad():
-            pbar = tqdm(test_loader, desc="预测中")
-            for images, _ in pbar:
-                images = images.to(self.device)
-                
-                # 前向传播
-                outputs = self.model(images)
-                if isinstance(outputs, dict):
-                    outputs = outputs['out']
-                
-                # 应用sigmoid激活
-                preds = torch.sigmoid(outputs)
-                
-                # 转换为numpy数组
-                preds = preds.cpu().numpy()
-                
-                # 处理每个样本
-                for pred in preds:
-                    # 二值化
-                    pred_binary = (pred[0] > 0.5).astype(np.uint8)
-                    
-                    # RLE编码
-                    rle = rle_encode(pred_binary)
-                    predictions.append(rle)
-        
-        print(f"预测完成! 共{len(predictions)}个样本")
-        return predictions
 
 
 def create_submission(predictions, test_paths, output_path):
@@ -365,6 +393,8 @@ def create_submission(predictions, test_paths, output_path):
         test_paths: 测试图像路径列表
         output_path: 输出文件路径
     """
+    import pandas as pd
+    
     # 提取文件名
     filenames = [os.path.basename(path) for path in test_paths]
     
@@ -379,6 +409,27 @@ def create_submission(predictions, test_paths, output_path):
     print(f"提交文件已保存: {output_path}")
     
     return submission_df
+
+
+def create_hf_trainer(model, config, train_dataset, eval_dataset=None):
+    """
+    创建Hugging Face训练器
+    
+    Args:
+        model: 模型
+        config: 配置对象
+        train_dataset: 训练数据集
+        eval_dataset: 验证数据集
+    
+    Returns:
+        CustomTrainer: 自定义训练器
+    """
+    return CustomTrainer(
+        model=model,
+        config=config,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset
+    )
 
 
 if __name__ == "__main__":
@@ -398,8 +449,8 @@ if __name__ == "__main__":
     model = get_model('fcn_resnet50')
     model = model.to(config.DEVICE)
     
-    # 创建训练器
-    trainer = Trainer(model, config)
+    # 创建Hugging Face训练器
+    trainer = create_hf_trainer(model, config, train_loader.dataset, val_loader.dataset)
     
-    print("训练器创建成功!")
+    print("Hugging Face训练器创建成功!")
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
